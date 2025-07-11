@@ -162,8 +162,8 @@ def calculate_perpendicular_distance(line1: dict, line2: dict) -> float:
 
 def detect_wall_orientation(line: dict) -> str:
     """Determine wall orientation (Rule 5.1)"""
-    dx = abs(line["p2"]["x"] - line1["p1"]["x"])
-    dy = abs(line["p2"]["y"] - line1["p1"]["y"])
+    dx = abs(line["p2"]["x"] - line["p1"]["x"])
+    dy = abs(line["p2"]["y"] - line["p1"]["y"])
     
     return "horizontal" if dx > dy else "vertical"
 
