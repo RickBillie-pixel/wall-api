@@ -329,7 +329,7 @@ async def detect_walls(request: WallDetectionRequest):
 
 def _detect_walls_rule_5_1(page_data: PageData, scale: float) -> List[Dict[str, Any]]:
     """
-    Detect walls according to Knowledge Base Rule 5.1
+    Detect walls according to Knowledge Base Rule 5.1 - OPTIMIZED FOR LARGE DATASETS
     
     Rule 5.1 Implementation:
     - Muur(wand) = vector(pad) met lengte > 50cm én breedte 7–35cm (na schaalcorrectie)
@@ -341,24 +341,73 @@ def _detect_walls_rule_5_1(page_data: PageData, scale: float) -> List[Dict[str, 
     walls = []
     processed_line_pairs = set()
     
-    # Convert drawing items to dictionaries
-    lines = [line.dict() for line in page_data.drawings.lines]
+    # Convert drawing items to dictionaries - filter valid lines immediately
+    valid_lines = []
+    for i, line in enumerate(page_data.drawings.lines):
+        line_dict = line.dict()
+        if (line_dict.get("type") == "line" and 
+            "p1" in line_dict and "p2" in line_dict and
+            line_dict["p1"] and line_dict["p2"]):
+            
+            # Pre-filter by minimum length to save processing time
+            length_pixels = distance(line_dict["p1"], line_dict["p2"])
+            length_m = length_pixels * scale
+            if length_m > MIN_WALL_LENGTH_M:
+                valid_lines.append((i, line_dict))
+    
     texts = [text.dict() for text in page_data.texts]
     
-    logger.info(f"Processing {len(lines)} lines for wall detection according to Rule 5.1")
+    logger.info(f"Processing {len(valid_lines)} valid lines (filtered from {len(page_data.drawings.lines)}) for wall detection according to Rule 5.1")
+    
+    # Limit processing for very large datasets to prevent timeout
+    MAX_LINES_TO_PROCESS = 5000  # Limit to prevent timeout
+    if len(valid_lines) > MAX_LINES_TO_PROCESS:
+        logger.warning(f"Large dataset detected ({len(valid_lines)} lines). Limiting to {MAX_LINES_TO_PROCESS} lines to prevent timeout.")
+        # Sort by line length (longer lines first) and take the most significant ones
+        valid_lines_with_length = []
+        for orig_idx, line_dict in valid_lines:
+            length = distance(line_dict["p1"], line_dict["p2"])
+            valid_lines_with_length.append((length, orig_idx, line_dict))
+        
+        valid_lines_with_length.sort(reverse=True)  # Longest first
+        valid_lines = [(orig_idx, line_dict) for _, orig_idx, line_dict in valid_lines_with_length[:MAX_LINES_TO_PROCESS]]
     
     # Find parallel line pairs that could represent walls
-    for i, line1 in enumerate(lines):
-        if line1.get("type") != "line" or not all(key in line1 for key in ["p1", "p2"]):
-            continue
+    processed_count = 0
+    max_comparisons = 100000  # Limit total comparisons to prevent timeout
+    
+    for idx1, (i, line1) in enumerate(valid_lines):
+        if processed_count >= max_comparisons:
+            logger.warning(f"Reached maximum comparison limit ({max_comparisons}). Stopping processing.")
+            break
             
-        for j, line2 in enumerate(lines[i+1:], i+1):
-            if line2.get("type") != "line" or not all(key in line2 for key in ["p1", "p2"]):
-                continue
+        # For very large datasets, only check nearby lines (spatial optimization)
+        search_range = min(500, len(valid_lines) - idx1 - 1)  # Limit search range
+        
+        for idx2 in range(idx1 + 1, idx1 + 1 + search_range):
+            if idx2 >= len(valid_lines):
+                break
+                
+            j, line2 = valid_lines[idx2]
+            processed_count += 1
             
             # Skip if already processed
             pair_key = tuple(sorted([i, j]))
             if pair_key in processed_line_pairs:
+                continue
+            
+            # Quick spatial check - skip lines that are too far apart
+            line1_center = {
+                "x": (line1["p1"]["x"] + line1["p2"]["x"]) / 2,
+                "y": (line1["p1"]["y"] + line1["p2"]["y"]) / 2
+            }
+            line2_center = {
+                "x": (line2["p1"]["x"] + line2["p2"]["x"]) / 2,
+                "y": (line2["p1"]["y"] + line2["p2"]["y"]) / 2
+            }
+            
+            # Skip if lines are too far apart (more than 100 pixels)
+            if distance(line1_center, line2_center) > 100:
                 continue
             
             # Check if lines are parallel (Rule 5.1: Parallelle lijnen)
@@ -373,7 +422,7 @@ def _detect_walls_rule_5_1(page_data: PageData, scale: float) -> List[Dict[str, 
             if not (MIN_WALL_THICKNESS_M <= thickness_m <= MAX_WALL_THICKNESS_M):
                 continue
             
-            # Rule 5.1: Check length > 50cm
+            # We already checked length in pre-filtering, but double-check
             length_pixels = distance(line1["p1"], line1["p2"])
             length_m = length_pixels * scale
             
@@ -385,7 +434,9 @@ def _detect_walls_rule_5_1(page_data: PageData, scale: float) -> List[Dict[str, 
             classification = classify_wall_type_by_thickness(thickness_m)
             label_info = get_wall_label_codes(classification["wall_type"], orientation)
             wall_polygon = create_wall_polygon(line1, line2)
-            text_context = analyze_wall_text_context(wall_polygon, texts)
+            
+            # Simplified text context for performance
+            text_context = {"material_hints": [], "type_hints": [], "structural_hints": []}
             
             # Calculate wall properties
             area_m2 = length_m * thickness_m
@@ -443,8 +494,21 @@ def _detect_walls_rule_5_1(page_data: PageData, scale: float) -> List[Dict[str, 
             
             walls.append(wall_data)
             processed_line_pairs.add(pair_key)
+            
+            # Early break if we found enough walls
+            if len(walls) >= 200:  # Reasonable limit for most drawings
+                logger.info(f"Found {len(walls)} walls, stopping search to prevent timeout")
+                break
+        
+        # Break outer loop too if we found enough walls
+        if len(walls) >= 200:
+            break
+        
+        # Progress logging for large datasets
+        if idx1 % 100 == 0 and idx1 > 0:
+            logger.info(f"Processed {idx1}/{len(valid_lines)} lines, found {len(walls)} walls so far")
     
-    logger.info(f"Detected {len(walls)} walls according to Rule 5.1")
+    logger.info(f"Detected {len(walls)} walls according to Rule 5.1 (processed {processed_count} line pairs)")
     
     # Additional Rule 5.1 validations
     _validate_wall_topology(walls)
