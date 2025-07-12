@@ -1,11 +1,3 @@
-"""
-Wall Detection API - Knowledge Base Implementation Rule 5.1
-Implements complete knowledge base for wall detection according to Rule 5.1:
-- Muur(wand) = vector(pad) met lengte > 50cm én breedte 7–35cm (na schaalcorrectie)
-- Parallelle lijnen 7–35cm uit elkaar (geschaald) vormen een muur(wand)
-- Buitenmuur(wand): 25–35cm dik; vormt gesloten polygoon; altijd dikker dan binnenmuur(wand)
-- Binnenmuur(wand): 7–25cm dik; altijd tussen buitenmuren; sluit aan op andere muren(wanden)/componenten
-"""
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, validator
 from shapely.geometry import Polygon, Point, LineString
@@ -368,10 +360,10 @@ def _validate_wall_topology(walls: List[Dict[str, Any]]) -> None:
         wall["validation"]["topology_valid"] = bool(wall.get("connected_walls"))
         if not wall["validation"]["topology_valid"]:
             wall["validation"]["errors"] = wall["validation"].get("errors", []) + [{
-                "error_code": "WALL_TOPOLOGY_003",
-                "message": "Wall not connected to other walls or components",
-                "severity": "warning"
-            }]
+                    "error_code": "WALL_TOPOLOGY_003",
+                    "message": "Wall not connected to other walls or components",
+                    "severity": "warning"
+                }]
         wall["validation"]["rule_5_1_thickness_hierarchy"] = True
 
 @app.get("/")
@@ -427,6 +419,7 @@ if __name__ == "__main__":
         "bind": "0.0.0.0:" + str(port),
         "workers": 4,
         "worker_class": "uvicorn.workers.UvicornWorker",
-        "timeout": 300  # Set timeout to 300 seconds
+        "timeout": 300,  # Enforce 300-second timeout
+        "graceful_timeout": 300  # Allow 300 seconds for graceful shutdown
     }
     StandaloneApplication(app, options).run()
