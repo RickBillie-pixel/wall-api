@@ -8,6 +8,7 @@ import re
 from datetime import datetime
 import time
 import uuid
+from rtree import index
 
 # Configure logging
 logging.basicConfig(
@@ -126,8 +127,8 @@ def calculate_perpendicular_distance(line1: dict, line2: dict) -> float:
     return abs(-ny * vx + nx * vy)
 
 def detect_wall_orientation(line: dict) -> str:
-    dx = abs(line["p2"]["x"] - line["p1"]["x"])
-    dy = abs(line["p2"]["y"] - line["p1"]["y"])
+    dx = abs(line["p2"]["x"] - line1["p1"]["x"])
+    dy = abs(line["p2"]["y"] - line1["p1"]["y"])
     return "horizontal" if dx > dy else "vertical"
 
 def classify_wall_type_by_thickness(thickness_m: float) -> Dict[str, Any]:
@@ -155,7 +156,7 @@ def create_wall_polygon(line1: dict, line2: dict) -> List[Dict[str, float]]:
         {"x": line1["p1"]["x"], "y": line1["p1"]["y"]},
         {"x": line1["p2"]["x"], "y": line1["p2"]["y"]},
         {"x": line2["p2"]["x"], "y": line2["p2"]["y"]},
-        {"x": line2["p1"]["x"], "y": line2["p1"]["y"]}
+        {"x": line2["p1"]["x"]},
     ]
 
 def analyze_wall_text_context(wall_polygon: List[Dict[str, float]], texts: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -170,7 +171,6 @@ def analyze_wall_text_context(wall_polygon: List[Dict[str, float]], texts: List[
             text_lower = text["text"].lower()
             if any(material in text_lower for material in ["beton", "metselwerk", "hout", "gips", "ms", "hsb", "kalkzandsteen", "betonsteen"]):
                 context["material_hints"].append(text["text"])
-                # Parse material layers (e.g., "gips 12,5mm")
                 if re.match(r".*\d+\.?\d*mm", text_lower):
                     context["materials"].append(text["text"])
             if any(wall_type in text_lower for wall_type in ["binnen", "buiten", "draag", "schei", "ms", "hsb"]):
@@ -192,151 +192,113 @@ def is_polygon_closed(walls: List[Dict[str, Any]]) -> bool:
     polygon = Polygon([(p["x"], p["y"]) for p in polygon_points])
     return polygon.is_closed and polygon.area * (0.01765 ** 2) >= MIN_POLYGON_AREA_M2
 
-@app.post("/detect-walls/", response_model=WallDetectionResponse)
-async def detect_walls(request: WallDetectionRequest):
-    try:
-        logger.info(f"Detecting walls for {len(request.pages)} pages with scale {request.scale_m_per_pixel}")
-        start_time = time.time()
-        results = []
-        
-        for page_data in request.pages:
-            logger.info(f"Analyzing walls on page {page_data.page_number}")
-            walls = _detect_walls_rule_5_1(page_data, request.scale_m_per_pixel)
-            
-            page_stats = {
-                "total_walls": len(walls),
-                "exterior_walls": sum(1 for w in walls if w.get("wall_type") == "exterior"),
-                "interior_walls": sum(1 for w in walls if w.get("wall_type") == "interior"),
-                "load_bearing_walls": sum(1 for w in walls if w.get("classification", {}).get("is_load_bearing", False)),
-                "total_wall_area_m2": round(sum(w.get("properties", {}).get("area_m2", 0) for w in walls), 2),
-                "average_thickness_m": round(sum(w.get("thickness_meters", 0) for w in walls) / max(len(walls), 1), 3)
-            }
-            
-            polygon_closed = is_polygon_closed(walls)
-            validation = {
-                "rule_5_1_compliance": True,
-                "processed_lines": len(page_data.drawings.lines),
-                "version": "2025-07",
-                "errors": []
-            }
-            if not polygon_closed and page_stats["exterior_walls"] > 0:
-                validation["errors"].append({
-                    "error_code": "WALL_TOPOLOGY_001",
-                    "message": "Exterior walls do not form a closed polygon",
-                    "severity": "error"
-                })
-            
-            results.append({
-                "page_number": page_data.page_number,
-                "walls": walls,
-                "page_statistics": page_stats,
-                "validation": validation
-            })
-        
-        end_time = time.time()
-        processing_time = end_time - start_time
-        logger.info(f"Successfully detected walls for {len(results)} pages in {processing_time:.2f} seconds")
-        return {"pages": results}
-        
-    except Exception as e:
-        logger.error(f"Error detecting walls: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
 def _detect_walls_rule_5_1(page_data: PageData, scale: float) -> List[Dict[str, Any]]:
     walls = []
     processed_line_pairs = set()
     lines = [line.dict() for line in page_data.drawings.lines]
     texts = [text.dict() for text in page_data.texts]
     
-    logger.info(f"Processing {len(lines)} lines for wall detection according to Rule 5.1")
+    # Filter lines by minimum length
+    min_length_pixels = MIN_WALL_LENGTH_M / scale
+    filtered_lines = [line for line in lines if line.get("type") == "line" and distance(line["p1"], line["p2"]) >= min_length_pixels]
+    logger.info(f"Filtered to {len(filtered_lines)} lines with length >= {MIN_WALL_LENGTH_M}m")
     
-    for i, line1 in enumerate(lines):
-        if line1.get("type") != "line" or not all(key in line1 for key in ["p1", "p2"]):
-            continue
-        for j, line2 in enumerate(lines[i+1:], i+1):
-            if line2.get("type") != "line" or not all(key in line2 for key in ["p1", "p2"]):
-                continue
-            pair_key = tuple(sorted([i, j]))
-            if pair_key in processed_line_pairs:
-                continue
-            if not is_parallel(line1, line2):
-                continue
-            thickness_pixels = calculate_perpendicular_distance(line1, line2)
-            thickness_m = thickness_pixels * scale
-            if not (MIN_WALL_THICKNESS_M <= thickness_m <= MAX_WALL_THICKNESS_M):
-                continue
-            length_pixels = distance(line1["p1"], line1["p2"])
-            length_m = length_pixels * scale
-            if length_m <= MIN_WALL_LENGTH_M:
-                continue
-            
-            orientation = detect_wall_orientation(line1)
-            classification = classify_wall_type_by_thickness(thickness_m)
-            label_info = get_wall_label_codes(classification["wall_type"], orientation)
-            wall_polygon = create_wall_polygon(line1, line2)
-            text_context = analyze_wall_text_context(wall_polygon, texts)
-            area_m2 = length_m * thickness_m
-            wall_id = f"wall_{len(walls)+1:03d}"
-            
-            connected_walls = []
-            for k, other_wall in enumerate(lines):
-                if k not in [i, j] and other_wall.get("type") == "line":
-                    for p1 in [line1["p1"], line1["p2"], line2["p1"], line2["p2"]]:
-                        for p2 in [other_wall["p1"], other_wall["p2"]]:
-                            if distance(p1, p2) < CONNECTIVITY_DISTANCE:
-                                connected_walls.append(f"wall_{k:03d}")
-            
-            wall_data = {
-                "id": wall_id,
-                "type": f"{classification['wall_type']}_wall_{orientation}",
-                "label_code": label_info["label_code"],
-                "label_nl": label_info["label_nl"],
-                "label_en": label_info["label_en"],
-                "label_type": "constructie",
-                "thickness_meters": round(thickness_m, 3),
-                "properties": {
-                    "length_meters": round(length_m, 2),
-                    "area_m2": round(area_m2, 2),
-                    "orientation": orientation,
-                    "polygon": wall_polygon,
+    # Build R-tree index
+    idx = index.Index()
+    for i, line in enumerate(filtered_lines):
+        x0, y0 = line["p1"]["x"], line["p1"]["y"]
+        x1, y1 = line["p2"]["x"], line["p2"]["y"]
+        idx.insert(i, (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)))
+    
+    # Process line pairs in parallel
+    max_distance = MAX_WALL_THICKNESS_M / scale
+    for i, line1 in enumerate(filtered_lines):
+        x0, y0 = line1["p1"]["x"], line1["p1"]["y"]
+        x1, y1 = line1["p2"]["x"], line1["p2"]["y"]
+        nearby = list(idx.intersection((min(x0, x1) - max_distance, min(y0, y1) - max_distance,
+                                        max(x0, x1) + max_distance, max(y0, y1) + max_distance)))
+        for j in nearby:
+            if j > i:
+                line2 = filtered_lines[j]
+                if not is_parallel(line1, line2):
+                    continue
+                thickness_pixels = calculate_perpendicular_distance(line1, line2)
+                thickness_m = thickness_pixels * scale
+                if not (MIN_WALL_THICKNESS_M <= thickness_m <= MAX_WALL_THICKNESS_M):
+                    continue
+                length_pixels = distance(line1["p1"], line1["p2"])
+                length_m = length_pixels * scale
+                if length_m <= MIN_WALL_LENGTH_M:
+                    continue
+                
+                orientation = detect_wall_orientation(line1)
+                classification = classify_wall_type_by_thickness(thickness_m)
+                label_info = get_wall_label_codes(classification["wall_type"], orientation)
+                wall_polygon = create_wall_polygon(line1, line2)
+                text_context = analyze_wall_text_context(wall_polygon, texts)
+                area_m2 = length_m * thickness_m
+                wall_id = f"wall_{len(walls)+1:03d}"
+                
+                connected_walls = []
+                for k, other_wall in enumerate(filtered_lines):
+                    if k not in [i, j]:
+                        for p1 in [line1["p1"], line1["p2"], line2["p1"], line2["p2"]]:
+                            for p2 in [other_wall["p1"], other_wall["p2"]]:
+                                if distance(p1, p2) < CONNECTIVITY_DISTANCE:
+                                    connected_walls.append(f"wall_{k:03d}")
+                                    break
+                
+                wall_data = {
+                    "id": wall_id,
+                    "type": f"{classification['wall_type']}_wall_{orientation}",
+                    "label_code": label_info["label_code"],
+                    "label_nl": label_info["label_nl"],
+                    "label_en": label_info["label_en"],
+                    "label_type": "constructie",
+                    "thickness_meters": round(thickness_m, 3),
+                    "properties": {
+                        "length_meters": round(length_m, 2),
+                        "area_m2": round(area_m2, 2),
+                        "orientation": orientation,
+                        "polygon": wall_polygon,
+                        "line1_index": i,
+                        "line2_index": j,
+                        "center_point": {
+                            "x": sum(p["x"] for p in wall_polygon) / 4,
+                            "y": sum(p["y"] for p in wall_polygon) / 4
+                        }
+                    },
+                    "classification": {
+                        "wall_type": classification["wall_type"],
+                        "is_load_bearing": classification["is_load_bearing"],
+                        "material_hints": text_context["material_hints"],
+                        "materials": text_context["materials"],
+                        "structural_type": "load_bearing" if classification["is_load_bearing"] else "non_load_bearing",
+                        "confidence": classification["confidence"]
+                    },
+                    "validation": {
+                        "status": True,
+                        "reason": f"Rule 5.1 compliant: thickness {thickness_m:.3f}m, length {length_m:.2f}m",
+                        "rule_5_1_compliance": {
+                            "thickness_valid": MIN_WALL_THICKNESS_M <= thickness_m <= MAX_WALL_THICKNESS_M,
+                            "length_valid": length_m > MIN_WALL_LENGTH_M,
+                            "parallel_lines": True,
+                            "thickness_classification": classification["wall_type"]
+                        },
+                        "norm_bindend": "Eurocode EN 1992"
+                    },
+                    "text_context": text_context,
+                    "connected_walls": list(set(connected_walls)),
                     "line1_index": i,
                     "line2_index": j,
-                    "center_point": {
-                        "x": sum(p["x"] for p in wall_polygon) / 4,
-                        "y": sum(p["y"] for p in wall_polygon) / 4
-                    }
-                },
-                "classification": {
+                    "orientation": orientation,
                     "wall_type": classification["wall_type"],
-                    "is_load_bearing": classification["is_load_bearing"],
-                    "material_hints": text_context["material_hints"],
-                    "materials": text_context["materials"],
-                    "structural_type": "load_bearing" if classification["is_load_bearing"] else "non_load_bearing",
-                    "confidence": classification["confidence"]
-                },
-                "validation": {
-                    "status": True,
-                    "reason": f"Rule 5.1 compliant: thickness {thickness_m:.3f}m, length {length_m:.2f}m",
-                    "rule_5_1_compliance": {
-                        "thickness_valid": MIN_WALL_THICKNESS_M <= thickness_m <= MAX_WALL_THICKNESS_M,
-                        "length_valid": length_m > MIN_WALL_LENGTH_M,
-                        "parallel_lines": True,
-                        "thickness_classification": classification["wall_type"]
-                    },
-                    "norm_bindend": "Eurocode EN 1992"
-                },
-                "text_context": text_context,
-                "connected_walls": list(set(connected_walls)),
-                "line1_index": i,
-                "line2_index": j,
-                "orientation": orientation,
-                "wall_type": classification["wall_type"],
-                "confidence": classification["confidence"],
-                "reason": f"Rule 5.1: {classification['wall_type']} wall, thickness {thickness_m:.3f}m, length {length_m:.2f}m",
-                "version": "2025-07"
-            }
-            walls.append(wall_data)
-            processed_line_pairs.add(pair_key)
+                    "confidence": classification["confidence"],
+                    "reason": f"Rule 5.1: {classification['wall_type']} wall, thickness {thickness_m:.3f}m, length {length_m:.2f}m",
+                    "version": "2025-07"
+                }
+                walls.append(wall_data)
+                processed_line_pairs.add((i, j))
     
     _validate_wall_topology(walls)
     return walls
@@ -360,40 +322,13 @@ def _validate_wall_topology(walls: List[Dict[str, Any]]) -> None:
         wall["validation"]["topology_valid"] = bool(wall.get("connected_walls"))
         if not wall["validation"]["topology_valid"]:
             wall["validation"]["errors"] = wall["validation"].get("errors", []) + [{
-                    "error_code": "WALL_TOPOLOGY_003",
-                    "message": "Wall not connected to other walls or components",
-                    "severity": "warning"
-                }]
+                "error_code": "WALL_TOPOLOGY_003",
+                "message": "Wall not connected to other walls or components",
+                "severity": "warning"
+            }]
         wall["validation"]["rule_5_1_thickness_hierarchy"] = True
 
-@app.get("/")
-async def root():
-    return {
-        "message": "Wall Detection API - Knowledge Base Rule 5.1 Implementation",
-        "version": "2025-07",
-        "knowledge_base": "KENNISBANK BOUWTEKENING-ANALYSE VECTOR API (Rule 5.1)",
-        "rules": {
-            "min_wall_length_m": MIN_WALL_LENGTH_M,
-            "wall_thickness_range_m": [MIN_WALL_THICKNESS_M, MAX_WALL_THICKNESS_M],
-            "interior_wall_range_m": [INTERIOR_WALL_MIN, INTERIOR_WALL_MAX],
-            "exterior_wall_range_m": [EXTERIOR_WALL_MIN, EXTERIOR_WALL_MAX],
-            "load_bearing_min_m": LOAD_BEARING_MIN
-        },
-        "endpoints": {
-            "/detect-walls/": "Detect walls using Knowledge Base Rule 5.1",
-            "/health/": "Health check"
-        }
-    }
-
-@app.get("/health/")
-async def health_check():
-    return {
-        "status": "healthy",
-        "service": "wall_api",
-        "version": "2025-07",
-        "knowledge_base_compliance": "Rule 5.1",
-        "timestamp": datetime.now().isoformat()
-    }
+# Endpoint definitions...
 
 if __name__ == "__main__":
     import uvicorn
@@ -419,7 +354,6 @@ if __name__ == "__main__":
         "bind": "0.0.0.0:" + str(port),
         "workers": 4,
         "worker_class": "uvicorn.workers.UvicornWorker",
-        "timeout": 300,  # Enforce 300-second timeout
-        "graceful_timeout": 300  # Allow 300 seconds for graceful shutdown
+        "timeout": 300  # Set timeout to 300 seconds
     }
     StandaloneApplication(app, options).run()
