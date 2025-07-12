@@ -405,4 +405,28 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    from gunicorn.app.base import BaseApplication
+    import os
+
+    class StandaloneApplication(BaseApplication):
+        def __init__(self, app, options=None):
+            self.application = app
+            self.options = options or {}
+            super().__init__()
+
+        def load_config(self):
+            for key, value in self.options.items():
+                if key in self.cfg.settings and value is not None:
+                    self.cfg.set(key.lower(), value)
+
+        def load(self):
+            return self.application
+
+    port = int(os.environ.get("PORT", 8000))
+    options = {
+        "bind": "0.0.0.0:" + str(port),
+        "workers": 4,
+        "worker_class": "uvicorn.workers.UvicornWorker",
+        "timeout": 300  # Set timeout to 300 seconds
+    }
+    StandaloneApplication(app, options).run()
